@@ -4,6 +4,7 @@ import { spawn, spawnSync } from 'node:child_process';
 import { mkdtempSync, readFileSync, writeFileSync, existsSync, mkdirSync, rmSync } from 'node:fs';
 import { tmpdir, homedir, platform } from 'node:os';
 import { join, basename, resolve } from 'node:path';
+import http from 'node:http';
 
 const CONFIG_DIR = join(homedir(), '.k6kt');
 const CONFIG_FILE = join(CONFIG_DIR, 'config.json');
@@ -175,35 +176,109 @@ async function cmdRun(args) {
   }
 }
 
+const DASHBOARD_PORT = 5665; // what the browser opens (our proxy)
+const K6_DASHBOARD_PORT = 5667; // k6's own dashboard, behind the proxy
+const K6_REST = '127.0.0.1:6575'; // not 6566: fetch() blocks that port
+const debug = (...m) => process.env.K6KT_DEBUG && console.error('[k6kt debug]', ...m);
+
+/**
+ * Tiny proxy in front of k6's dashboard. k6 v2 keeps running after the test while a
+ * browser is still connected to the dashboard, and only writes its summary on exit.
+ * Closing the proxied connections when the test ends lets k6 exit on its own.
+ */
+function startDashboardProxy() {
+  const open = new Set();
+  const track = (x) => { open.add(x); x.on('close', () => open.delete(x)); };
+  const server = http.createServer((req, res) => {
+    const up = http.request(
+      { host: '127.0.0.1', port: K6_DASHBOARD_PORT, path: req.url, method: req.method, headers: req.headers },
+      (ur) => { res.writeHead(ur.statusCode, ur.headers); ur.pipe(res); },
+    );
+    up.on('error', () => { if (!res.headersSent) res.writeHead(502); res.end(); });
+    track(up);
+    req.pipe(up);
+  });
+  server.on('connection', track);
+  return new Promise((resolve) => {
+    server.once('error', () => resolve(null)); // port busy: no proxy, dashboard still on K6_DASHBOARD_PORT
+    server.listen(DASHBOARD_PORT, '127.0.0.1', () => resolve({
+      close() { debug('proxy close, open conns:', open.size); for (const x of open) x.destroy(); server.close(); },
+    }));
+  });
+}
+
+/** Resolves when k6's test is over (REST API says not running, or goes away after being up). */
+async function waitForTestEnd(k6Exited) {
+  let seenRunning = false;
+  while (!k6Exited()) {
+    await sleep(2000);
+    try {
+      const r = await fetch(`http://${K6_REST}/v1/status`, { signal: AbortSignal.timeout(1500) });
+      const a = (await r.json()).data?.attributes || {};
+      debug('status', JSON.stringify(a));
+      if (a.running) seenRunning = true;
+      else if (seenRunning) return;
+    } catch (e) {
+      debug('status error', e.message, e.cause?.code, e.cause?.message);
+      if (seenRunning) return;
+    }
+  }
+}
+
 async function runLocal(cfg, id, archive, dir, args) {
   const summary = join(dir, 'summary.json');
   const report = join(dir, 'report.html');
-  console.log(c.d('Live dashboard: http://127.0.0.1:5665 (opens in your browser)'));
+  const proxy = await startDashboardProxy();
+  const dashUrl = `http://127.0.0.1:${proxy ? DASHBOARD_PORT : K6_DASHBOARD_PORT}`;
+  console.log(c.d(`Live dashboard: ${dashUrl} (opens in your browser)`));
   const env = {
     ...process.env,
     K6_WEB_DASHBOARD: 'true',
+    K6_WEB_DASHBOARD_HOST: '127.0.0.1',
+    K6_WEB_DASHBOARD_PORT: String(K6_DASHBOARD_PORT),
     K6_WEB_DASHBOARD_EXPORT: report,
-    // We open the browser ourselves (below) so Chrome's own log noise stays out of the terminal.
+    // We open the browser ourselves so Chrome's own log noise stays out of the terminal.
     K6_WEB_DASHBOARD_OPEN: 'false',
   };
-  if (!args['no-browser']) setTimeout(() => openInBrowser('http://127.0.0.1:5665'), 2000).unref();
-  // k6 handles Ctrl+C itself (stops gracefully, still writes the summary); we just wait.
-  const onSig = () => {};
-  process.on('SIGINT', onSig);
-  const code = await new Promise((res) => {
-    const p = spawn(k6Bin(), ['run', '--summary-trend-stats', TREND_STATS, '--summary-export', summary, archive], { stdio: 'inherit', env });
-    p.on('exit', (code) => res(code ?? 1));
-  });
-  process.off('SIGINT', onSig);
+  if (!args['no-browser']) setTimeout(() => openInBrowser(dashUrl), 2000).unref();
 
-  const urls = await api(cfg, 'POST', `/runs/${id}/uploads`);
-  if (existsSync(summary)) await upload(urls.summary, summary);
-  if (existsSync(report)) await upload(urls.report, report);
-  else console.log(c.d('(k6 skips the HTML report for runs shorter than ~30s)'));
-  const run = await api(cfg, 'POST', `/runs/${id}/finish`, { exitCode: code });
-  printResult(run);
-  if (existsSync(report)) await printReportLink(cfg, id);
-  return run.status === 'passed' ? 0 : 1;
+  // Ctrl+C goes to k6 (it stops the test gracefully and still writes the summary).
+  // We keep running until the results are saved.
+  let interrupts = 0;
+  const onSig = () => {
+    interrupts += 1;
+    if (interrupts === 1) console.log(c.y('\nStopping the test... results will still be saved.'));
+    if (interrupts >= 3) process.exit(130);
+  };
+  process.on('SIGINT', onSig);
+
+  let exited = false;
+  const k6proc = spawn(k6Bin(), [
+    'run', '--address', K6_REST, '--summary-trend-stats', TREND_STATS, '--summary-export', summary, archive,
+  ], { stdio: 'inherit', env });
+  const code = new Promise((res) => k6proc.on('exit', (c2) => { exited = true; res(c2 ?? 1); }));
+
+  // When the test is over, disconnect the browser so k6 can finish and write its summary.
+  waitForTestEnd(() => exited).then(async () => {
+    await sleep(3000); // let the dashboard send its final numbers
+    proxy?.close();
+  });
+  const exitCode = await code;
+  proxy?.close();
+
+  console.log(c.d('Saving results...'));
+  try {
+    const urls = await api(cfg, 'POST', `/runs/${id}/uploads`);
+    if (existsSync(summary)) await upload(urls.summary, summary);
+    if (existsSync(report)) await upload(urls.report, report);
+    else console.log(c.d('(k6 skips the HTML report for runs shorter than ~30s)'));
+    const run = await api(cfg, 'POST', `/runs/${id}/finish`, { exitCode });
+    printResult(run);
+    if (existsSync(report)) await printReportLink(cfg, id);
+    return run.status === 'passed' ? 0 : 1;
+  } finally {
+    process.off('SIGINT', onSig);
+  }
 }
 
 async function runCloud(cfg, id, args) {
