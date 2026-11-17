@@ -1,0 +1,8 @@
+{
+  "name": "k6kt",
+  "version": "1.0.0",
+  "description": "K6-KT CLI: run k6 tests locally or on AWS",
+  "type": "module",
+  "bin": { "k6kt": "./k6kt.mjs" },
+  "engines": { "node": ">=18" }
+}

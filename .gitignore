@@ -1,0 +1,20 @@
+# Terraform
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+terraform/.build/
+crash.log
+# Node
+node_modules/
+# k6 / CLI outputs
+*.tar
+summary.json
+report.html
+.k6kt-tmp/
+# Editors / OS
+.~lock.*#
+.DS_Store
+.vscode/
+# Internal planning docs (kept local, not in git)
+*.docx
