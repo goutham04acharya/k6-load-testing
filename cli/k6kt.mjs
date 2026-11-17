@@ -183,8 +183,10 @@ async function runLocal(cfg, id, archive, dir, args) {
     ...process.env,
     K6_WEB_DASHBOARD: 'true',
     K6_WEB_DASHBOARD_EXPORT: report,
-    K6_WEB_DASHBOARD_OPEN: args['no-browser'] ? 'false' : 'true',
+    // We open the browser ourselves (below) so Chrome's own log noise stays out of the terminal.
+    K6_WEB_DASHBOARD_OPEN: 'false',
   };
+  if (!args['no-browser']) setTimeout(() => openInBrowser('http://127.0.0.1:5665'), 2000).unref();
   // k6 handles Ctrl+C itself (stops gracefully, still writes the summary); we just wait.
   const onSig = () => {};
   process.on('SIGINT', onSig);
