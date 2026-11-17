@@ -131,11 +131,12 @@ function printResult(run) {
   }
 }
 
-async function printReportLink(cfg, id) {
+async function printReportLink(cfg, id, args = {}) {
   try {
-    const { url, runners } = await api(cfg, 'GET', `/runs/${id}/report`);
-    console.log(`  Report:     ${url}`);
-    console.log(c.d(`              link valid 1 hour; get a fresh one any time with: k6kt open ${id}${runners > 1 ? ` [--runner 1..${runners}]` : ''}`));
+    const { shareUrl, runners } = await api(cfg, 'GET', `/runs/${id}/link`);
+    console.log(`  Report:     ${c.b(shareUrl)}`);
+    console.log(c.d(`              permanent link, anyone with it can view${runners > 1 ? ` (add ?runner=1..${runners} for one runner)` : ''}. Open it any time: k6kt open ${id}`));
+    if (args.open) openInBrowser(shareUrl);
   } catch (e) {
     console.log(c.d(`  Report:     ${e.message}`));
   }
@@ -274,7 +275,7 @@ async function runLocal(cfg, id, archive, dir, args) {
     else console.log(c.d('(k6 skips the HTML report for runs shorter than ~30s)'));
     const run = await api(cfg, 'POST', `/runs/${id}/finish`, { exitCode });
     printResult(run);
-    if (existsSync(report)) await printReportLink(cfg, id);
+    await printReportLink(cfg, id, args);
     return run.status === 'passed' ? 0 : 1;
   } finally {
     process.off('SIGINT', onSig);
@@ -327,7 +328,7 @@ async function runCloud(cfg, id, args) {
     }
     if (['passed', 'failed', 'error', 'stopped'].includes(run.status)) {
       printResult(run);
-      if (run.result) await printReportLink(cfg, id);
+      if (run.result) await printReportLink(cfg, id, args);
       return run.status === 'passed' ? 0 : 1;
     }
   }
@@ -358,13 +359,35 @@ async function cmdStatus(args) {
   if (args.json) console.log(JSON.stringify(run, null, 2));
 }
 
+/** Run id from the command line, or the newest run when none is given. */
+async function runIdOrLatest(cfg, args) {
+  if (args._[1]) return args._[1];
+  const { runs } = await api(cfg, 'GET', '/runs?limit=1').catch((e) => die(e.message));
+  if (!runs.length) die('no runs yet');
+  console.log(c.d(`latest run: ${runs[0].id} (${runs[0].scriptName}, ${runs[0].status})`));
+  return runs[0].id;
+}
+
 async function cmdOpen(args) {
   const cfg = loadConfig();
-  const id = args._[1] || die('usage: k6kt open <run-id> [--runner N] [--file report|summary|result]');
-  const q = new URLSearchParams({ runner: args.runner || '1', file: args.file || 'report' });
-  const { url } = await api(cfg, 'GET', `/runs/${id}/report?${q}`).catch((e) => die(e.message));
+  const id = await runIdOrLatest(cfg, args);
+  if (args.file && args.file !== 'report') {
+    const q = new URLSearchParams({ runner: args.runner || '1', file: args.file });
+    const { url } = await api(cfg, 'GET', `/runs/${id}/report?${q}`).catch((e) => die(e.message));
+    console.log(url);
+    return openInBrowser(url);
+  }
+  const { shareUrl } = await api(cfg, 'GET', `/runs/${id}/link`).catch((e) => die(e.message));
+  const url = args.runner ? `${shareUrl}?runner=${args.runner}` : shareUrl;
   console.log(url);
   openInBrowser(url);
+}
+
+async function cmdLink(args) {
+  const cfg = loadConfig();
+  const id = await runIdOrLatest(cfg, args);
+  const { shareUrl } = await api(cfg, 'GET', `/runs/${id}/link`).catch((e) => die(e.message));
+  console.log(shareUrl);
 }
 
 async function cmdStop(args) {
@@ -383,16 +406,18 @@ const HELP = `k6kt — run k6 load tests on your laptop or on AWS
         --spot                               use Fargate Spot (cheaper, may be interrupted)
         --runners N                          split the test across N runners
         --no-wait                            start and return immediately
+        --open                               open the report in your browser when the run ends
   k6kt list [--limit N]                      recent runs
   k6kt status <run-id> [--json]              status and result of one run
-  k6kt open <run-id> [--runner N]            open the HTML report (fresh 1-hour link)
+  k6kt open [run-id] [--runner N]            open the report in your browser (newest run if no id)
+  k6kt link [run-id]                         print the permanent share link (newest run if no id)
   k6kt stop <run-id>                         stop a run
 
 Exit code: 0 when the run passed, 1 when it failed (thresholds, errors), 2 on usage errors.
 Env: K6KT_API / K6KT_TOKEN override the saved login (useful in CI). K6_BIN = path to k6.`;
 
 const args = parseArgs(process.argv.slice(2));
-const commands = { login: cmdLogin, run: cmdRun, list: cmdList, ls: cmdList, status: cmdStatus, open: cmdOpen, stop: cmdStop };
+const commands = { login: cmdLogin, run: cmdRun, list: cmdList, ls: cmdList, status: cmdStatus, open: cmdOpen, link: cmdLink, stop: cmdStop };
 const fn = commands[args._[0]];
 if (!fn || args.help) {
   console.log(HELP);

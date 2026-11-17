@@ -22,7 +22,7 @@ AWS account `072707626196`, region `ap-south-1`, profile `goutham-iam`.
 |---|---|
 | `terraform/` | All AWS infrastructure, one file per area (`network.tf`, `s3.tf`, `dynamodb.tf`, `ecr.tf`, `ecs.tf`, `lambda.tf`, `step-functions.tf`, `api-gateway.tf`). State is in S3. |
 | `terraform/bootstrap/` | Creates the S3 bucket that holds Terraform state. Applied once; a bucket cannot store the state that creates it, so this is separate. |
-| `lambda/` | Code for the 3 Lambda functions: `api` (HTTP API), `prepare` (plans runners), `merge` (combines results). |
+| `lambda/` | Code for the 3 Lambda functions: `api` (HTTP API + report pages/PDF), `prepare` (plans runners), `merge` (combines results). |
 | `runner/` | Docker image each Fargate runner uses: k6 + a start script. |
 | `cli/k6kt.mjs` | The command testers use. No dependencies, Node 18+. |
 | `scripts/` | Admin helpers: build the runner image, create projects/tokens, store secrets, install k6. |
@@ -48,7 +48,9 @@ Tip: `alias k6kt="node $PWD/cli/k6kt.mjs"` so you can type `k6kt ...`.
 | `k6kt run test.js --cloud --spot` | Uses Fargate Spot: ~70% cheaper, AWS may interrupt it. Avoid for release tests |
 | `k6kt list` | Recent runs with p95, error rate and status |
 | `k6kt status <run-id>` | One run in detail |
-| `k6kt open <run-id> [--runner N]` | Opens the HTML report (makes a fresh 1-hour link) |
+| `k6kt open [run-id]` | Opens the run's report page in your browser (newest run if no id) |
+| `k6kt link [run-id]` | Prints the run's permanent share link (newest run if no id) |
+| `k6kt run test.js --cloud --open` | Opens the report page automatically when the run ends |
 | `k6kt stop <run-id>` | Stops a run (Ctrl+C during `run --cloud` does the same) |
 
 `k6kt run` exits 0 when the run passed and 1 when it failed, so it can gate a CI pipeline:
@@ -60,6 +62,19 @@ Tip: `alias k6kt="node $PWD/cli/k6kt.mjs"` so you can type `k6kt ...`.
     K6KT_API: ${{ secrets.K6KT_API }}
     K6KT_TOKEN: ${{ secrets.K6KT_TOKEN }}
 ```
+
+### Reports
+
+Every run gets a **permanent link** (printed at the end of `k6kt run`, or `k6kt link <run-id>`).
+Anyone with the link can open it, with no login needed. The key in the link is random, so links can't be guessed.
+
+The report page shows pass/fail, the key numbers, thresholds, checks, a response-time breakdown and, for split tests, each runner.
+Below that is the full interactive k6 report with charts. Buttons at the top:
+
+- **Download PDF**: a printable summary. It is built the first time someone clicks it and saved to S3 (`runs/<id>/report.pdf`).
+- **Download HTML report**: the full interactive k6 report as one file that opens offline in any browser.
+
+The "Report" button *inside* the k6 report is k6's own "save this page" button; you don't need it.
 
 ### Writing tests
 

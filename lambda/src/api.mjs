@@ -1,6 +1,6 @@
 // HTTP API for the k6kt CLI (and the web app later).
 // Auth: "Authorization: Bearer <token>". Tokens are stored as SHA-256 hashes in DynamoDB.
-import { createHash, randomBytes } from 'node:crypto';
+import { createHash, randomBytes, timingSafeEqual } from 'node:crypto';
 import { PutCommand, QueryCommand } from '@aws-sdk/lib-dynamodb';
 import { GetObjectCommand, PutObjectCommand, HeadObjectCommand } from '@aws-sdk/client-s3';
 import { getSignedUrl } from '@aws-sdk/s3-request-presigner';
@@ -10,6 +10,7 @@ import {
   TABLE, BUCKET, ddb, s3, getItem, getRun, updateRun, readJson, deleteKey,
   runKey, runPrefix, summarize, mergeSummaries, statusFromExitCodes, ACTIVE,
 } from './lib.mjs';
+import { loadDetails, renderPage, buildPdf } from './report.mjs';
 
 const sfn = new SFNClient({});
 const ecs = new ECSClient({});
@@ -258,12 +259,76 @@ async function reportLink(ctx, id, event) {
     throw new HttpError(404, `${file} not available for this run${file === 'report' ? ' (k6 skips the HTML report for runs under ~30s)' : ''}`);
   }
   const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: BUCKET, Key, ResponseContentType: type }), { expiresIn: LINK_TTL });
-  return json(200, { url, expiresInSeconds: LINK_TTL, runners: n });
+  return json(200, { url, expiresInSeconds: LINK_TTL, runners: n, shareUrl: await shareUrl(event, run) });
 }
+
+// ---------------- permanent share links: /r/<run-id>/<key> ----------------
+// No login needed; the 32-hex-char key is random per run, so links cannot be guessed.
+
+async function ensureShareKey(run) {
+  if (run.shareKey) return run.shareKey;
+  const key = randomBytes(16).toString('hex');
+  await updateRun(run.id, { shareKey: key });
+  return key;
+}
+
+async function shareUrl(event, run) {
+  const host = event.requestContext?.domainName || event.headers?.host;
+  return `https://${host}/r/${run.id}/${await ensureShareKey(run)}`;
+}
+
+async function linkHandler(event) {
+  const m = event.rawPath.match(/^\/r\/(r-[a-f0-9]+)\/([a-f0-9]{32})(?:\/(pdf|html|view))?\/?$/);
+  const notFound = () => html(404, '<!doctype html><meta charset="utf-8"><title>Not found</title><p style="font:15px system-ui;margin:40px">This report link is not valid.</p>');
+  if (!m) return notFound();
+  const [, id, key, action] = m;
+  const run = await getRun(id);
+  if (!run?.shareKey || !timingSafeEqual(Buffer.from(run.shareKey), Buffer.from(key))) return notFound();
+
+  const base = `/r/${id}/${key}`;
+  const n = run.mode === 'cloud' ? run.runners || 1 : 1;
+  const reportKey = (r) => `${runPrefix(id)}/runner-${r}/report.html`;
+  const exists = (Key) => s3.send(new HeadObjectCommand({ Bucket: BUCKET, Key })).then(() => true, () => false);
+  const redirect = async (Key, type, download) => ({
+    statusCode: 302,
+    headers: {
+      'cache-control': 'no-store',
+      location: await getSignedUrl(s3, new GetObjectCommand({
+        Bucket: BUCKET, Key, ResponseContentType: type,
+        ResponseContentDisposition: download ? `attachment; filename="${download}"` : undefined,
+      }), { expiresIn: 600 }),
+    },
+  });
+  const runner = Math.min(Math.max(Number(event.queryStringParameters?.runner) || 1, 1), n);
+
+  if (action === 'view' || action === 'html') {
+    if (!(await exists(reportKey(runner)))) return notFound();
+    return redirect(reportKey(runner), 'text/html; charset=utf-8',
+      action === 'html' ? `k6kt-${id}${n > 1 ? `-runner${runner}` : ''}.html` : undefined);
+  }
+
+  if (action === 'pdf') {
+    const finished = ['passed', 'failed', 'error', 'stopped'].includes(run.status);
+    const pdfKey = `${runPrefix(id)}/report.pdf`;
+    // Built once when first asked for, then served from S3.
+    if (!finished || !(await exists(pdfKey))) {
+      const host = event.requestContext?.domainName || event.headers?.host;
+      const pdf = await buildPdf(run, await loadDetails(run), `https://${host}${base}`);
+      await s3.send(new PutObjectCommand({ Bucket: BUCKET, Key: pdfKey, Body: pdf, ContentType: 'application/pdf' }));
+    }
+    return redirect(pdfKey, 'application/pdf', `k6kt-${id}.pdf`);
+  }
+
+  const reports = [];
+  for (let i = 1; i <= n; i++) if (await exists(reportKey(i))) reports.push(i);
+  return html(200, renderPage(run, await loadDetails(run), base, reports));
+}
+
+const html = (status, body) => ({ statusCode: status, headers: { 'content-type': 'text/html; charset=utf-8', 'cache-control': 'no-store' }, body });
 
 function publicRun(r) {
   if (!r) return r;
-  const { pk, gsi1pk, gsi1sk, executionArn, ...rest } = r;
+  const { pk, gsi1pk, gsi1sk, executionArn, shareKey, ...rest } = r;
   return rest;
 }
 
@@ -277,6 +342,10 @@ const routes = [
   ['POST', /^\/runs\/(r-[a-f0-9]+)\/finish$/, (c, e, m) => finishRun(c, m[1], e)],
   ['POST', /^\/runs\/(r-[a-f0-9]+)\/stop$/, (c, e, m) => stopRun(c, m[1])],
   ['GET', /^\/runs\/(r-[a-f0-9]+)\/report$/, (c, e, m) => reportLink(c, m[1], e)],
+  ['GET', /^\/runs\/(r-[a-f0-9]+)\/link$/, async (c, e, m) => {
+    const run = await loadOwnRun(c, m[1]);
+    return json(200, { shareUrl: await shareUrl(e, run), runners: run.mode === 'cloud' ? run.runners || 1 : 1 });
+  }],
 ];
 
 export async function handler(event) {
@@ -284,6 +353,7 @@ export async function handler(event) {
   const path = (event.rawPath || '/').replace(/\/+$/, '') || '/';
   try {
     if (method === 'GET' && path === '/health') return json(200, { ok: true });
+    if (method === 'GET' && path.startsWith('/r/')) return await linkHandler(event);
     const route = routes.find(([m, re]) => m === method && re.test(path));
     if (!route) throw new HttpError(404, `no route ${method} ${path}`);
     const ctx = await auth(event);
