@@ -1,27 +1,47 @@
+output "web_url" {
+  value = module.frontend.web_url
+}
+
 output "api_url" {
-  value = aws_apigatewayv2_api.main.api_endpoint
+  value = module.backend.api_url
+}
+
+output "web_bucket" {
+  value = module.frontend.web_bucket_name
+}
+
+output "web_distribution_id" {
+  value = module.frontend.distribution_id
 }
 
 output "runs_bucket" {
-  value = aws_s3_bucket.runs.bucket
+  value = module.storage.runs_bucket_name
 }
 
 output "table_name" {
-  value = aws_dynamodb_table.main.name
+  value = module.storage.table_name
 }
 
 output "ecr_repository_url" {
-  value = aws_ecr_repository.runner.repository_url
+  value = module.storage.ecr_repository_url
 }
 
 output "cluster_name" {
-  value = aws_ecs_cluster.main.name
+  value = module.runner.cluster_name
 }
 
 output "state_machine_arn" {
-  value = aws_sfn_state_machine.run.arn
+  value = module.backend.state_machine_arn
+}
+
+output "secrets_path_prefix" {
+  value = local.secrets_path_prefix
 }
 
 output "region" {
   value = var.region
+}
+
+output "terraform_state_bucket" {
+  value = module.terraform_state.bucket_name
 }

@@ -3,18 +3,29 @@
 *.tfstate
 *.tfstate.*
 *.tfplan
+tfplan
 terraform/.build/
 crash.log
-# Node
+
+# Node / builds
 node_modules/
-# k6 / CLI outputs
+backend/dist/
+frontend/dist/
+
+# Local env
+.env
+.env.local
+*.local
+
+# k6 outputs
 *.tar
 summary.json
 report.html
-.k6kt-tmp/
-# Editors / OS
-.~lock.*#
-.DS_Store
-.vscode/
+
 # Internal planning docs (kept local, not in git)
 *.docx
+.~lock.*#
+
+# Editors / OS
+.DS_Store
+.vscode/

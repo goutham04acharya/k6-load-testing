@@ -1,144 +1,151 @@
-# K6-KT — self-hosted k6 load testing on AWS
+# Load Testing k6
 
-Testers write a normal k6 script, run one command, and the test runs on AWS Fargate (one or many machines).
-Results are saved centrally with an HTML report. No servers run when nobody is testing (idle cost < $1/month).
+Run [k6](https://grafana.com/docs/k6/) load tests on AWS from a web page or the command line.
+Pick the APIs to call, choose how many users, press **Run**: machines start on AWS Fargate, split the load,
+stream live numbers, and every result is saved with a shareable report and PDF.
+Nothing runs between tests, so the idle cost is under $1/month.
 
 ```
-k6kt CLI ──► API Gateway ──► API Lambda ──► DynamoDB (projects, tokens, runs)
-                                 │
-                                 ▼
-                      Step Functions workflow
-           Prepare ──► N × Fargate runners (k6) ──► Merge
+ Web app (React)  ─┐
+                   ├─► API Gateway ─► api Lambda ─► DynamoDB (projects, tokens, runs)
+ loadtest CLI    ──┘          │
+                              ▼
+                   Step Functions workflow
+        prepare Lambda ─► N × Fargate machines running k6 ─► merge Lambda
                               │
                               ▼
-                     S3 (script, progress, summary, report.html)
+               S3 (scripts, live progress, summaries, HTML/PDF reports)
 ```
 
-AWS account `072707626196`, region `ap-south-1`, profile `goutham-iam`.
+AWS account `072707626196`, region `ap-south-1` (Mumbai), profile `goutham-iam`.
 
 ## Repository layout
 
-| Path | What it is |
-|---|---|
-| `terraform/` | All AWS infrastructure, one file per area (`network.tf`, `s3.tf`, `dynamodb.tf`, `ecr.tf`, `ecs.tf`, `lambda.tf`, `step-functions.tf`, `api-gateway.tf`). State is in S3. |
-| `terraform/bootstrap/` | Creates the S3 bucket that holds Terraform state. Applied once; a bucket cannot store the state that creates it, so this is separate. |
-| `lambda/` | Code for the 3 Lambda functions: `api` (HTTP API + report pages/PDF), `prepare` (plans runners), `merge` (combines results). |
-| `runner/` | Docker image each Fargate runner uses: k6 + a start script. |
-| `cli/k6kt.mjs` | The command testers use. No dependencies, Node 18+. |
-| `scripts/` | Admin helpers: build the runner image, create projects/tokens, store secrets, install k6. |
-| `examples/` | Example tests. |
-
-## For testers: running tests
-
-One-time setup:
-
-```bash
-./scripts/install-k6.sh                       # installs k6 into ~/.local/bin (or install k6 any other way)
-node cli/k6kt.mjs login --api <api-url> --token <your-token>   # an admin gives you both
+```
+backend/                 TypeScript: Lambdas, CLI, load machine image, admin scripts
+  src/functions/api/       HTTP API + public report pages (handler.ts, runs.ts, share.ts)
+  src/functions/prepare/   plans machines and splits the load
+  src/functions/merge/     combines machine results, decides pass/fail
+  src/lib/                 shared types, storage, result merging, report page + PDF
+  src/cli/loadtest.ts      the `loadtest` command
+  runner/                  Docker image each load machine runs (k6 + start script)
+  scripts/                 create projects/tokens, store secrets, push the runner image
+  examples/                example k6 scripts
+  test/                    unit tests
+frontend/                TypeScript + React (Vite): the web app
+  src/pages/               Runs, New test, Run detail, Compare, Settings, Sign in
+  scripts/deploy.sh        build and upload to S3 + CloudFront
+terraform/               all AWS resources
+  main.tf                  the whole system: calls the modules below
+  variables.tf / outputs.tf / providers.tf / versions.tf / terraform.tfvars
+  modules/terraform-state  S3 bucket holding Terraform state
+  modules/network          VPC, public subnets, security group (no NAT Gateway)
+  modules/storage          S3 runs bucket, DynamoDB table, ECR repository
+  modules/runner           ECS cluster, machine sizes (task definitions), roles
+  modules/backend          Lambdas, Step Functions workflow, HTTP API
+  modules/frontend         S3 web bucket + CloudFront
 ```
 
-Tip: `alias k6kt="node $PWD/cli/k6kt.mjs"` so you can type `k6kt ...`.
+### Naming
 
-| Command | What it does |
+Every AWS resource is named `load-testing-k6-<component>` and tagged
+`Application=Load Testing k6`, `Project=load-testing-k6`, `ManagedBy=terraform`.
+
+| Resource | Name |
 |---|---|
-| `k6kt run test.js --local` | Runs on your laptop with a live dashboard (http://127.0.0.1:5665), then saves results centrally |
-| `k6kt run test.js --cloud` | Runs on AWS and prints progress every 10 s, then the result and report link |
-| `k6kt run test.js --cloud -e BASE_URL=https://staging.example.com` | Passes values to `__ENV` in the script |
-| `k6kt run test.js --cloud --runners 4` | Splits the test across 4 machines (done automatically above 500 VUs) |
-| `k6kt run test.js --cloud --spot` | Uses Fargate Spot: ~70% cheaper, AWS may interrupt it. Avoid for release tests |
-| `k6kt list` | Recent runs with p95, error rate and status |
-| `k6kt status <run-id>` | One run in detail |
-| `k6kt open [run-id]` | Opens the run's report page in your browser (newest run if no id) |
-| `k6kt link [run-id]` | Prints the run's permanent share link (newest run if no id) |
-| `k6kt run test.js --cloud --open` | Opens the report page automatically when the run ends |
-| `k6kt stop <run-id>` | Stops a run (Ctrl+C during `run --cloud` does the same) |
+| Terraform state bucket | `load-testing-k6-terraform-state` |
+| Runs bucket / web bucket | `load-testing-k6-runs` / `load-testing-k6-web` |
+| DynamoDB table | `load-testing-k6-main` |
+| Lambdas | `load-testing-k6-api`, `-prepare`, `-merge` |
+| Workflow | `load-testing-k6-run-workflow` |
+| API | `load-testing-k6-api` |
+| ECS cluster / ECR | `load-testing-k6-cluster` / `load-testing-k6-runner` |
+| Machine sizes | `load-testing-k6-runner-small`, `-medium`, `-large` |
+| VPC / security group | `load-testing-k6-vpc` / `load-testing-k6-runner-sg` |
+| Secrets (SSM) | `/load-testing-k6/<project>/<NAME>` |
 
-`k6kt run` exits 0 when the run passed and 1 when it failed, so it can gate a CI pipeline:
+## Using the web app
 
-```yaml
-# GitHub Actions example
-- run: node cli/k6kt.mjs run tests/checkout.js --cloud
-  env:
-    K6KT_API: ${{ secrets.K6KT_API }}
-    K6KT_TOKEN: ${{ secrets.K6KT_TOKEN }}
-```
+Sign in with your API token, then **New test**:
 
-### Reports
+1. **APIs to call**: method, URL, headers, body, expected status. Add more calls, or **Import from cURL**
+   (paste "Copy as cURL" from browser dev tools or Postman). Use `{{NAME}}` for values from step 4 or project secrets.
+2. **Load**: start from a template (Smoke, Load, Stress, Spike, Soak) or pick a shape: ramp up & down,
+   steady users, requests per second, or spike. A chart previews the shape.
+3. **Pass rules**: p95 response time, error rate, status checks.
+4. **Environment values**, 5. **Machines** (count, Spot), then **Run test**.
 
-Every run gets a **permanent link** (printed at the end of `k6kt run`, or `k6kt link <run-id>`).
-Anyone with the link can open it, with no login needed. The key in the link is random, so links can't be guessed.
+The run page shows the phases, a progress bar and live charts (users, requests/s, p95, errors) every 10 s,
+with a **Stop** button. When it finishes: results, a **Per API** table, the full report, **Download PDF**,
+**Copy share link** and **Run again**. **Compare** shows two runs side by side with ▲/▼ changes.
+Or use **Write or upload script** to run any single-file k6 script.
 
-The report page shows pass/fail, the key numbers, thresholds, checks, a response-time breakdown and, for split tests, each runner.
-Below that is the full interactive k6 report with charts. Buttons at the top:
-
-- **Download PDF**: a printable summary. It is built the first time someone clicks it and saved to S3 (`runs/<id>/report.pdf`).
-- **Download HTML report**: the full interactive k6 report as one file that opens offline in any browser.
-
-The "Report" button *inside* the k6 report is k6's own "save this page" button; you don't need it.
-
-### Writing tests
-
-Normal k6 scripts work unchanged, including imports of other local files (they are bundled with `k6 archive`).
-Use `thresholds` to decide pass/fail, for example `http_req_duration: ['p(95)<500']`.
-
-Notes:
-- k6 skips the HTML report for runs shorter than about 30 seconds. The numbers are still saved.
-- On AWS, scripts cannot call private IP ranges, localhost or the AWS metadata endpoints (blocked on purpose).
-- With several runners, `setup()` runs once **per runner**.
-- With several runners, p90/p95/p99/max show the worst runner (a safe upper bound); counts and rates are exact.
-
-## For admins
-
-All scripts use profile `goutham-iam` and region `ap-south-1` (override with `AWS_PROFILE` / `AWS_REGION`).
+## Using the CLI
 
 ```bash
-./scripts/create-project.sh shop-app 1000 60 2 15 5000   # name, maxVUs, maxMinutes, runs at once, maxRunners, VU-hours/month
+cd backend && npm install && npm run build && npm link     # installs the `loadtest` command
+./scripts/install-k6.sh                                    # k6 for local runs (~/.local/bin)
+loadtest login --api <api-url> --token <token>
+
+loadtest run test.js --local          # on your laptop, live dashboard, results saved centrally
+loadtest run test.js --cloud --open   # on AWS, opens the report when done
+loadtest list | status <id> | open [id] | link [id] | stop <id>
+```
+
+`loadtest run` exits 0 when the run passed and 1 when it failed, so it can gate CI
+(`LOADTEST_API` / `LOADTEST_TOKEN` environment variables replace `login`).
+
+## Admin
+
+```bash
+cd backend
+./scripts/create-project.sh shop-app 1000 60 2 15 5000   # name, max users, max minutes, runs at once, max machines, VU-hours/month
 ./scripts/create-token.sh shop-app alice-laptop          # prints the token once (only its hash is stored)
-./scripts/set-secret.sh shop-app TEST_PASS               # prompts for the value; script reads __ENV.TEST_PASS on AWS runs
+./scripts/revoke-token.sh <token>
+./scripts/set-secret.sh shop-app TEST_PASS               # prompts for the value
 ```
 
-Revoke a token: set `revoked = true` on its `TOKEN#<sha256>` item in the `k6kt` DynamoDB table.
+Machine sizes: up to 100 users → 0.5 vCPU / 1 GB; 101–250 → 1 vCPU / 2 GB; 251–500 → 2 vCPU / 4 GB;
+more → ceil(users ÷ 500) machines of 2 vCPU / 4 GB. The account's Fargate quota is 30 vCPU (≈ 7,500 users);
+request more in Service Quotas for bigger tests.
 
-### Runner sizes
-
-| VUs per runner | Fargate size |
-|---|---|
-| up to 100 | 0.5 vCPU / 1 GB |
-| 101–250 | 1 vCPU / 2 GB |
-| 251–500 | 2 vCPU / 4 GB |
-| more than 500 VUs total | ceil(VUs ÷ 500) runners of 2 vCPU / 4 GB |
-
-The account's Fargate quota is **30 vCPU** (both on-demand and Spot) = 15 large runners ≈ 7,500 VUs.
-Request an increase in Service Quotas before running bigger tests.
-
-## Deploying changes
+## Deploying
 
 ```bash
-# 1. Lambda dependencies (needed before plan/apply, because Terraform zips lambda/)
-(cd lambda && npm ci --omit=dev && npm test)
+# 1. Backend code (Terraform zips backend/dist/lambda)
+cd backend && npm ci && npm run check && cd ..
 
-# 2. Infrastructure + Lambda code
-cd terraform
-terraform init          # first time only; state lives in s3://k6kt-tfstate-072707626196
-terraform plan -out=tfplan
-terraform apply tfplan
-cd ..
+# 2. Infrastructure
+cd terraform && terraform init && terraform plan -out=tfplan && terraform apply tfplan && cd ..
 
-# 3. Runner image (only when runner/ changes)
-./scripts/build-runner.sh
+# 3. Load machine image (only when backend/runner changes)
+backend/scripts/build-runner.sh
+
+# 4. Web app
+frontend/scripts/deploy.sh
 ```
 
-First-time setup from an empty account: `cd terraform/bootstrap && terraform init && terraform apply` creates the state bucket, then run the steps above.
+Terraform state lives in `s3://load-testing-k6-terraform-state` (created by `modules/terraform-state`, protected
+from deletion). On a brand-new account, comment out the `backend "s3"` block in `versions.tf` for the first
+`terraform apply`, then restore it and run `terraform init -migrate-state`.
+
+Run the web app locally against the deployed API:
+
+```bash
+cd frontend
+echo "VITE_API_URL=$(terraform -chdir=../terraform output -raw api_url)" > .env.local
+npm install && npm run dev        # http://localhost:5173
+```
 
 ## Cost
 
-About $2–3/month at 500 tests × 20 VUs × 5 min. You pay for runner minutes, public IPs while runners run, and outbound traffic above 100 GB/month.
-Nothing runs between tests. Logs are kept 14 days, and run files are deleted after 180 days.
+About $2–3/month at 500 tests × 20 users × 5 min. You pay for machine minutes, their public IPs while
+running, and outbound traffic above 100 GB/month. Logs are kept 14 days; run files 180 days.
 
-## Tearing it down
+## Tearing down
 
 ```bash
 cd terraform && terraform destroy
 ```
 
-This deletes everything, including saved runs. The state bucket in `terraform/bootstrap` stays until you destroy it separately.
+The state bucket is protected (`prevent_destroy`), so it stays unless you remove that line first.
